@@ -1,0 +1,449 @@
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import cgi
+import os
+import json
+import urllib.parse
+import mimetypes
+import datetime
+import random
+import string
+import shutil
+from PIL import Image
+
+UPLOAD_DIR = 'uploads'
+USER_DB_FILE = 'users.json'
+SESSION_DB_FILE = 'sessions.json'
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+if not os.path.exists(USER_DB_FILE):
+    with open(USER_DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump({}, f)
+
+if not os.path.exists(SESSION_DB_FILE):
+    with open(SESSION_DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump({}, f)
+
+
+def load_json_file(filename):
+    with open(filename, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def save_json_file(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def hash_password(password):
+    import hashlib
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+
+def verify_password(password, hash_):
+    return hash_password(password) == hash_
+
+
+def generate_session_id(length=64):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+
+def parse_cookies(cookie_header):
+    cookies = {}
+    if not cookie_header:
+        return cookies
+    parts = cookie_header.split(';')
+    for part in parts:
+        if '=' in part:
+            key, val = part.strip().split('=', 1)
+            cookies[key] = val
+    return cookies
+
+
+def html_escape(text):
+    import html
+    return html.escape(text)
+
+
+def allowed_file_extension(filename):
+    ALLOWED_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in ALLOWED_EXTS
+
+
+def get_content_type(file_path):
+    type_, _ = mimetypes.guess_type(file_path)
+    if not type_:
+        return 'application/octet-stream'
+    return type_
+
+
+def get_average_color(image_path):
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert('RGB')
+            pixels = list(img.getdata())
+            num_pixels = len(pixels)
+            avg = tuple(sum(c[i] for c in pixels) // num_pixels for i in range(3))
+            return avg
+    except Exception:
+        return (0, 0, 0)
+
+
+def format_filesize(num_bytes):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if num_bytes < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} TB"
+
+
+def build_navbar(is_logged_in, username=''):
+    nav_links = [
+        ('Главная', '/dashboard'),
+        ('Страница 1', '/page1'),
+        ('Страница 2', '/page2'),
+        ('Страница 3', '/page3')
+    ]
+    nav_html = '<nav style="background-color:#001144; padding:10px; display:flex; gap:20px; align-items:center;">\n'
+    for name, link in nav_links:
+        nav_html += f'<a href="{link}" style="color:#66ccff; text-decoration:none; font-weight:bold;">{html_escape(name)}</a>\n'
+    nav_html += '<div style="margin-left:auto; color:#55aaff;">'
+    if is_logged_in:
+        nav_html += f'Пользователь: {html_escape(username)} | <a href="/logout" style="color:#ff6666;">Выйти</a>'
+    else:
+        nav_html += '<a href="/login" style="color:#66ccff; text-decoration:none; font-weight:bold;">Войти</a> | '
+        nav_html += '<a href="/register" style="color:#66ccff; text-decoration:none; font-weight:bold;">Регистрация</a>'
+    nav_html += '</div></nav>\n'
+    return nav_html
+
+
+def render_template(title, body_html, is_logged_in=False, username='', extra_head=''):
+    style = """
+        body {
+            margin: 0;
+            background: linear-gradient(to bottom, #000000, #001122);
+            color: white;
+            font-family: 'Arial', sans-serif;
+            min-height: 100vh;
+        }
+        a {
+            color: #66ccff;
+        }
+        a:hover {
+            color: #99ccff;
+            text-decoration: underline;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 15px;
+        }
+        h1, h2, h3 {
+            color: #99ccff;
+            font-weight: 600;
+        }
+        form label {
+            display: block;
+            margin-top: 10px;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #88bbff;
+        }
+        input[type="text"],
+        input[type="password"],
+        input[type="file"],
+        select {
+            padding: 8px;
+            font-size: 16px;
+            border-radius: 5px;
+            border: none;
+            margin-bottom: 15px;
+            width: 100%;
+            max-width: 300px;
+            box-sizing: border-box;
+        }
+        input[type="submit"] {
+            background-color: #003366;
+            color: white;
+            border: none;
+            padding: 10px 30px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.25s;
+        }
+        input[type="submit"]:hover {
+            background-color: #0055aa;
+        }
+        .photo-block {
+            display: inline-block;
+            margin: 15px;
+            padding: 10px;
+            background: #001a33;
+            border-radius: 10px;
+            text-align: center;
+            vertical-align: top;
+            box-shadow: 0 0 10px rgba(0, 102, 204, 0.5);
+            width: 170px;
+        }
+        .photo-block img {
+            max-width: 150px;
+            border-radius: 10px;
+            box-shadow: 0 0 8px rgba(102, 204, 255, 0.7);
+            margin-bottom: 8px;
+        }
+        .msg {
+            background-color: #003366;
+            padding: 8px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            max-width: 400px;
+        }
+        .error {
+            background-color: #cc4444;
+            color: #fff;
+            font-weight: 600;
+        }
+        .success {
+            background-color: #44cc44;
+            color: #fff;
+            font-weight: 600;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            max-width: 900px;
+        }
+        table, th, td {
+            border: 1px solid #005599;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+        }
+        th {
+            background-color: #004080;
+        }
+        td {
+            background-color: #002244;
+        }
+    """
+    html_page = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>{html_escape(title)}</title>
+<style>{style}</style>
+{extra_head}
+</head>
+<body>
+{build_navbar(is_logged_in, username)}
+<div class="container">
+{body_html}
+</div>
+</body>
+</html>"""
+    return html_page
+
+
+class MyHTTPRequestHandler(BaseHTTPRequestHandler):
+    def load_sessions(self):
+        try:
+            return load_json_file(SESSION_DB_FILE)
+        except Exception:
+            return {}
+
+    def save_sessions(self, sessions):
+        save_json_file(SESSION_DB_FILE, sessions)
+
+    def get_current_user(self):
+        cookies = parse_cookies(self.headers.get('Cookie'))
+        session_id = cookies.get('sessionid')
+        if not session_id:
+            return None
+        sessions = self.load_sessions()
+        return sessions.get(session_id)
+
+    def send_html_response(self, content, status=200):
+        self.send_response(status)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(content.encode('utf-8'))
+
+    def send_redirect(self, location):
+        self.send_response(303)
+        self.send_header('Location', location)
+        self.end_headers()
+
+    def parse_post_data(self):
+        ctype, pdict = cgi.parse_header(self.headers.get('Content-Type'))
+        if ctype == 'multipart/form-data':
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST'})
+            return form
+        elif ctype == 'application/x-www-form-urlencoded':
+            length = int(self.headers.get('Content-Length'))
+            data = self.rfile.read(length).decode('utf-8')
+            return urllib.parse.parse_qs(data)
+        return {}
+
+    def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        query = urllib.parse.parse_qs(parsed_path.query)
+        if path.startswith('/uploads/'):
+            filepath = '.' + path
+            if os.path.isfile(filepath):
+                self.send_response(200)
+                self.send_header('Content-type', get_content_type(filepath))
+                self.send_header('Content-Length', os.path.getsize(filepath))
+                self.end_headers()
+                with open(filepath, 'rb') as f:
+                    shutil.copyfileobj(f, self.wfile)
+            else:
+                self.send_error(404, "Файл не найден")
+            return
+        if path == '/' or path == '/dashboard':
+            self.handle_dashboard(query)
+            return
+        elif path == '/login':
+            self.handle_login()
+            return
+        elif path == '/logout':
+            self.handle_logout()
+            return
+        elif path == '/register':
+            self.handle_register()
+            return
+        elif path == '/page1':
+            self.handle_page1()
+            return
+        elif path == '/page2':
+            self.handle_page2()
+            return
+        elif path == '/page3':
+            self.handle_page3()
+            return
+        else:
+            self.send_error(404, "Страница не найдена")
+
+    def do_POST(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        if path == '/login':
+            self.handle_login_post()
+            return
+        elif path == '/register':
+            self.handle_register_post()
+            return
+        elif path == '/upload':
+            self.handle_upload_post()
+            return
+        else:
+            self.send_error(404, "Страница не найдена")
+
+    def handle_dashboard(self, query):
+        user = self.get_current_user()
+        if not user:
+            self.send_redirect('/login')
+            return
+        sort_key = query.get('sort', ['name'])[0]
+        files = os.listdir(UPLOAD_DIR)
+        photos = []
+        for filename in files:
+            path = os.path.join(UPLOAD_DIR, filename)
+            if os.path.isfile(path) and allowed_file_extension(filename):
+                stat = os.stat(path)
+                avg_color = get_average_color(path)
+                photos.append({
+                    'name': filename,
+                    'size': stat.st_size,
+                    'format': os.path.splitext(filename)[1].lower(),
+                    'avg_color': avg_color,
+                    'mtime': stat.st_mtime
+                })
+        if sort_key == 'size':
+            photos.sort(key=lambda x: x['size'])
+        elif sort_key == 'format':
+            photos.sort(key=lambda x: x['format'])
+        elif sort_key == 'color':
+            photos.sort(key=lambda x: x['avg_color'])
+        elif sort_key == 'date':
+            photos.sort(key=lambda x: x['mtime'], reverse=True)
+        else:
+            photos.sort(key=lambda x: x['name'].lower())
+
+        sort_options_html = f"""
+            <form method="get" action="/dashboard" style="margin-bottom:20px;">
+              <label for="sort">Сортировать по:</label>
+              <select name="sort" id="sort" onchange="this.form.submit()">
+                <option value="name" {'selected' if sort_key == 'name' else ''}>названию</option>
+                <option value="size" {'selected' if sort_key == 'size' else ''}>весу</option>
+                <option value="format" {'selected' if sort_key == 'format' else ''}>формату</option>
+                <option value="color" {'selected' if sort_key == 'color' else ''}>цвету</option>
+                <option value="date" {'selected' if sort_key == 'date' else ''}>дате изменения</option>
+              </select>
+            </form>
+        """
+
+        photos_html = ''
+        for p in photos:
+            r, g, b = p['avg_color']
+            file_size_str = format_filesize(p['size'])
+            mod_time_str = datetime.datetime.fromtimestamp(p['mtime']).strftime('%Y-%m-%d %H:%M:%S')
+            photos_html += f"""
+            <div class="photo-block">
+                <img src="/uploads/{urllib.parse.quote(p['name'])}" alt="{html_escape(p['name'])}" title="{html_escape(p['name'])}">
+                <div><strong>{html_escape(p['name'])}</strong></div>
+                <div>Размер: {file_size_str}</div>
+                <div>Формат: {html_escape(p['format'])}</div>
+                <div>Дата: {mod_time_str}</div>
+                <div>Средний цвет: rgb({r},{g},{b})</div>
+            </div>
+            """
+
+        upload_form = """
+        <form enctype="multipart/form-data" method="POST" action="/upload" style="margin-top:30px; max-width: 350px;">
+            <label for="photo">Загрузить фото:</label>
+            <input id="photo" name="photo" type="file" required>
+            <input type="submit" value="Загрузить">
+        </form>
+        """
+
+        logout_msg = f"<div style='margin-top:10px;'>Вы вошли как <strong>{html_escape(user)}</strong></div>"
+
+        body_html = f"""
+        <h1>Панель управления</h1>
+        {logout_msg}
+        {sort_options_html}
+        <div style="display:flex; flex-wrap: wrap; justify-content: flex-start;">
+            {photos_html if photos_html else '<p>Нет загруженных фотографий.</p>'}
+        </div>
+        {upload_form}
+        """
+        page = render_template('Панель управления', body_html, True, user)
+        self.send_html_response(page)
+
+    def handle_login(self):
+        user = self.get_current_user()
+        if user:
+            self.send_redirect('/dashboard')
+            return
+        parsed_path = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_path.query)
+        error_msg = query.get('error', [''])[0]
+        success_msg = query.get('success', [''])[0]
+        msgs_html = ''
+        if error_msg:
+            msgs_html += f'<div class="msg error">{html_escape(error_msg)}</div>'
+        if success_msg:
+            msgs_html += f'<div class="msg success">{html_escape(success_msg)}</div>'
+        body_html = f"""
+        <h1>Вход в систему</h1>
+        {msgs_html}
+        <form method="post" action="/login" style="max-width: 300px;">
+            <label for="username">Имя пользователя</label>
+            <input id="username" name="username" type="text" maxlength="30" required>
+            <label for="password">Пароль</label>
